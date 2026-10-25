@@ -199,6 +199,30 @@ OpenCode V2 的全局插件目录是 `~/.config/opencode/plugins/`。把本目�
 - 目标会恢复为 **paused**，绝不自动续跑；
 - 发一条 “restored as paused” 提示；
 - 你确认后 `/goal resume` 继续。
+- 插件热重载（保存 `index.ts` / 配置）同样会让旧 owner 退出、目标变为 paused；
+  `/goal resume` 即可继续。
+
+## 多实例与所有权
+
+OpenCode 可能在同一进程里为同一个 location 启动不止一个插件实例（日志里会看到多条
+`loading plugin`）。每个实例都能收到同一份公共事件流；如果都去续轮，就会重复发提示，
+甚至把另一个实例刚建好的 active 目标“恢复”为 paused。
+
+插件用一个进程级 owner registry
+（`globalThis[Symbol.for("opencode.goal.owner-registry.v1")]`）为每个 session 选一个
+owner：
+
+- 只有 owner 会续轮、暂停和写持久化状态；
+- 其他实例看到 active 目标会直接跳过，不会暂停、不会发提示；
+- owner 每 30 秒心跳续租（租约 2 分钟）；owner 消失后，其他实例可以接手，并把目标
+  恢复为 paused；
+- `/goal status` 是只读的，不会抢所有权；
+- `/goal stop` / `resume` / `retry` / `clear` 会强制接管，旧 owner 在下一次事件或动作时
+  自动退出；
+- 进程真正重启后没有 owner registry，持久化的 active 目标会恢复为 paused，需要
+  `/goal resume`。
+
+这部分有对应的集成测试（两个 instance 共享 storage 和全局 registry）。
 
 ## 配置
 
@@ -269,7 +293,9 @@ npm test
 - 退避：抖动范围、递增、封顶；
 - 状态机：干净结束才续轮、`GOAL_DONE` 停止、`GOAL_BLOCKED` 暂停、
   失败后只发短重试行、欠费不重试、重试预算耗尽、轮数预算耗尽、
-  重启恢复为 paused、跨 location 事件过滤。
+  重启恢复为 paused、跨 location 事件过滤；
+- 多实例：第二个实例不会暂停/抢占 owner 的 active 目标、跨实例 `status` 只读、
+  跨实例 `stop` 强制接管后旧 owner 自动停手。
 
 ## License
 

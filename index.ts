@@ -151,6 +151,35 @@ const MAX_TEXT_CHARS = 64 * 1024
 const MAX_TEXT_MESSAGES = 4
 const MAX_HYDRATED_SESSIONS = 2_000
 
+/**
+ * OpenCode can boot the same location more than once and therefore load this
+ * plugin several times in one process.  Every instance sees the same public
+ * event stream, so without an owner every instance would try to continue the
+ * same goal (and the losers would "restore" the winner's active goal as
+ * paused).  A process-wide registry elects exactly one live owner per session.
+ *
+ * The registry is intentionally in memory: it is coordination for live
+ * instances, not persisted state.  If a process restarts, persisted goals are
+ * restored as paused and need an explicit `/goal resume`.
+ */
+const OWNER_REGISTRY_KEY = Symbol.for("opencode.goal.owner-registry.v1")
+const OWNER_LEASE_MS = 2 * 60_000
+const OWNER_HEARTBEAT_MS = 30_000
+const FOREIGN_RECHECK_MS = 30_000
+
+interface OwnerEntry {
+  instance: string
+  at: number
+}
+
+interface OwnerRegistry {
+  owners: Map<string, OwnerEntry>
+}
+
+const ownerRegistry: OwnerRegistry = ((globalThis as any)[OWNER_REGISTRY_KEY] ??= {
+  owners: new Map<string, OwnerEntry>(),
+})
+
 const MARKER_DONE = "GOAL_DONE"
 const MARKER_BLOCKED = "GOAL_BLOCKED"
 
@@ -593,8 +622,41 @@ export default {
     const states = new Map<string, GoalState>()
     const hydrated = new Set<string>()
     const loading = new Map<string, Promise<GoalState | undefined>>()
+    const foreign = new Map<string, number>()
     const disposables: Registration[] = []
     const controller = new AbortController()
+    const instanceID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+    const owns = (sessionID: string): boolean => {
+      const entry = ownerRegistry.owners.get(sessionID)
+      if (!entry || entry.instance !== instanceID) return false
+      entry.at = Date.now()
+      return true
+    }
+
+    const claim = (sessionID: string, force: boolean): boolean => {
+      const now = Date.now()
+      const entry = ownerRegistry.owners.get(sessionID)
+      if (!force && entry && entry.instance !== instanceID && now - entry.at < OWNER_LEASE_MS) {
+        return false
+      }
+      ownerRegistry.owners.set(sessionID, { instance: instanceID, at: now })
+      foreign.delete(sessionID)
+      return true
+    }
+
+    const release = (sessionID: string): void => {
+      const entry = ownerRegistry.owners.get(sessionID)
+      if (entry && entry.instance === instanceID) ownerRegistry.owners.delete(sessionID)
+    }
+
+    const heartbeat = setInterval(() => {
+      const now = Date.now()
+      for (const [sessionID, entry] of ownerRegistry.owners) {
+        if (entry.instance === instanceID) entry.at = now
+        else if (now - entry.at > OWNER_LEASE_MS * 4) ownerRegistry.owners.delete(sessionID)
+      }
+    }, OWNER_HEARTBEAT_MS)
 
     const keyFor = (sessionID: string): string => `goal.v${STORAGE_VERSION}.${sessionID}`
 
@@ -702,7 +764,15 @@ export default {
       }
     }
 
-    const loadState = async (sessionID: string): Promise<GoalState | undefined> => {
+    interface EnsureStateOptions {
+      readOnly?: boolean
+      force?: boolean
+    }
+
+    const loadState = async (
+      sessionID: string,
+      readOnly: boolean,
+    ): Promise<GoalState | undefined> => {
       hydrated.add(sessionID)
       if (hydrated.size > MAX_HYDRATED_SESSIONS) hydrated.clear()
 
@@ -718,6 +788,22 @@ export default {
       const data = raw as Record<string, unknown>
       const goal = typeof data.goal === "string" ? data.goal : ""
       if (!goal) return undefined
+
+      let info: SessionInfo | undefined
+      try {
+        info = await ctx.session.get({ sessionID })
+      } catch (error) {
+        debug("session.get failed for restored goal", error)
+      }
+
+      const sessionDirectory = normaliseDirectory(info?.location?.directory)
+      if (sessionDirectory && myDirectory && sessionDirectory !== myDirectory) {
+        // The goal belongs to another location; that location's plugin instance
+        // is the only one allowed to handle it.
+        foreign.set(sessionID, Date.now() + FOREIGN_RECHECK_MS)
+        hydrated.delete(sessionID)
+        return undefined
+      }
 
       const baselineCost =
         typeof data.baselineCost === "number" && Number.isFinite(data.baselineCost)
@@ -738,6 +824,8 @@ export default {
         typeof data.compactions === "number" && Number.isFinite(data.compactions)
           ? data.compactions
           : 0
+      if (info?.model) state.model = info.model
+      if (typeof info?.cost === "number" && Number.isFinite(info.cost)) state.cost = info.cost
 
       // Never auto-resume after a restart: the user may not expect spending.
       const wasActive = data.phase !== "paused"
@@ -748,17 +836,22 @@ export default {
           ? data.reason
           : "paused"
 
-      try {
-        const info = await ctx.session.get({ sessionID })
-        if (info.model) state.model = info.model
-        if (typeof info.cost === "number" && Number.isFinite(info.cost)) state.cost = info.cost
-      } catch (error) {
-        debug("session.get failed for restored goal", error)
+      if (wasActive) {
+        // `readOnly` is used by /goal status.  It must not steal ownership.
+        if (readOnly) return state
+
+        // Another live plugin instance owns this active goal.  Do not touch it:
+        // this is what used to pause healthy goals on every duplicate boot.
+        if (!claim(sessionID, false)) {
+          foreign.set(sessionID, Date.now() + FOREIGN_RECHECK_MS)
+          hydrated.delete(sessionID)
+          return undefined
+        }
       }
 
       states.set(sessionID, state)
-      persist(state)
-      if (wasActive) {
+      if (!readOnly) persist(state)
+      if (wasActive && !readOnly) {
         void notify(
           sessionID,
           "goal restored as paused after restart. /goal resume to continue.",
@@ -767,14 +860,27 @@ export default {
       return state
     }
 
-    const ensureState = async (sessionID: string): Promise<GoalState | undefined> => {
+    const ensureState = async (
+      sessionID: string,
+      options?: EnsureStateOptions,
+    ): Promise<GoalState | undefined> => {
       const existing = states.get(sessionID)
-      if (existing) return existing
+      if (existing) {
+        if (existing.phase === "active") owns(sessionID)
+        return existing
+      }
+
+      const until = foreign.get(sessionID)
+      if (until !== undefined) {
+        if (Date.now() < until) return undefined
+        foreign.delete(sessionID)
+      }
+
       const inFlight = loading.get(sessionID)
       if (inFlight) return inFlight
-      if (hydrated.has(sessionID)) return undefined
+      if (!options?.force && hydrated.has(sessionID)) return undefined
 
-      const task = loadState(sessionID).finally(() => {
+      const task = loadState(sessionID, options?.readOnly === true).finally(() => {
         loading.delete(sessionID)
       })
       loading.set(sessionID, task)
@@ -783,6 +889,13 @@ export default {
 
     const pause = (state: GoalState, reason: string, notice?: string): void => {
       if (state.phase !== "active") return
+      if (!owns(state.sessionID)) {
+        // Another instance took over (e.g. /goal on a different boot); do not
+        // overwrite its state.
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
       state.phase = "paused"
       state.reason = reason
       state.pending = false
@@ -794,6 +907,11 @@ export default {
     }
 
     const finish = (state: GoalState, notice: string): void => {
+      if (!owns(state.sessionID)) {
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
       state.phase = "done"
       state.pending = false
       state.pendingInbox = undefined
@@ -801,6 +919,8 @@ export default {
       clearRetry(state)
       states.delete(state.sessionID)
       hydrated.delete(state.sessionID)
+      foreign.delete(state.sessionID)
+      release(state.sessionID)
       void persistNow(state)
       void notify(state.sessionID, notice)
     }
@@ -810,6 +930,8 @@ export default {
       if (state) clearRetry(state)
       states.delete(sessionID)
       hydrated.delete(sessionID)
+      foreign.delete(sessionID)
+      ownerRegistry.owners.delete(sessionID)
       void ctx.storage.remove(keyFor(sessionID)).catch((error: unknown) => {
         console.error(`${LOG} failed to remove goal state`, sessionID, error)
       })
@@ -870,6 +992,11 @@ export default {
 
     const sendContinuation = async (state: GoalState, reinject: boolean): Promise<void> => {
       if (state.phase !== "active") return
+      if (!owns(state.sessionID)) {
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
       if (state.pending) return
       if (state.rounds >= cfg.maxRounds) {
         pause(
@@ -948,6 +1075,11 @@ export default {
 
     const runRetry = async (state: GoalState): Promise<void> => {
       if (state.phase !== "active") return
+      if (!owns(state.sessionID)) {
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
       if (state.busy || state.pending) return
       state.busy = true
       state.pending = true
@@ -1009,6 +1141,11 @@ export default {
 
     const onSucceeded = async (state: GoalState): Promise<void> => {
       if (state.phase !== "active") return
+      if (!owns(state.sessionID)) {
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
 
       const text = finalText(state)
       const marker = parseGoalMarker(text)
@@ -1075,6 +1212,11 @@ export default {
 
     const onFailed = async (state: GoalState, error: StructuredError | undefined): Promise<void> => {
       if (state.phase !== "active") return
+      if (!owns(state.sessionID)) {
+        clearRetry(state)
+        states.delete(state.sessionID)
+        return
+      }
       const cls = classifyError(error)
       state.lastError = {
         kind: cls.kind,
@@ -1115,7 +1257,7 @@ export default {
     /* ---------------------------------------------------------------------- */
 
     const showStatus = async (sessionID: string): Promise<void> => {
-      const state = await ensureState(sessionID)
+      const state = await ensureState(sessionID, { readOnly: true, force: true })
       if (!state) {
         await notify(sessionID, "goal: none. Use /goal <objective> to start.")
         return
@@ -1134,6 +1276,11 @@ export default {
         await notify(sessionID, "goal: empty objective.")
         return
       }
+
+      // An explicit /goal always takes ownership, even if another boot of
+      // this location currently owns an older goal.
+      claim(sessionID, true)
+      foreign.delete(sessionID)
 
       const existing = states.get(sessionID)
       if (existing) clearRetry(existing)
@@ -1175,11 +1322,14 @@ export default {
     }
 
     const resumeGoal = async (sessionID: string): Promise<void> => {
-      const state = await ensureState(sessionID)
+      const state = await ensureState(sessionID, { readOnly: true, force: true })
       if (!state) {
         await notify(sessionID, "goal: none. Use /goal <objective> to start.")
         return
       }
+      claim(sessionID, true)
+      states.set(sessionID, state)
+      hydrated.add(sessionID)
       clearRetry(state)
       state.phase = "active"
       state.reason = undefined
@@ -1197,11 +1347,14 @@ export default {
     }
 
     const retryNow = async (sessionID: string): Promise<void> => {
-      const state = await ensureState(sessionID)
+      const state = await ensureState(sessionID, { readOnly: true, force: true })
       if (!state) {
         await notify(sessionID, "goal: none. Use /goal <objective> to start.")
         return
       }
+      claim(sessionID, true)
+      states.set(sessionID, state)
+      hydrated.add(sessionID)
       clearRetry(state)
       if (state.busy || state.pending) {
         await notify(sessionID, "goal: session is busy; run /goal retry again when it is idle.")
@@ -1220,6 +1373,8 @@ export default {
       const state = states.get(sessionID)
       if (state) clearRetry(state)
       states.delete(sessionID)
+      foreign.delete(sessionID)
+      ownerRegistry.owners.delete(sessionID)
       hydrated.add(sessionID)
       try {
         await ctx.storage.remove(keyFor(sessionID))
@@ -1254,12 +1409,25 @@ export default {
               return
             case "stop":
             case "pause": {
-              const state = await ensureState(sessionID)
+              const state = await ensureState(sessionID, { readOnly: true, force: true })
               if (!state) {
                 await notify(sessionID, "goal: none.")
                 return
               }
-              pause(state, "user", "goal paused. /goal resume to continue.")
+              claim(sessionID, true)
+              states.set(sessionID, state)
+              hydrated.add(sessionID)
+              // A read-only load always represents the goal as paused; mark it
+              // and persist explicitly instead of relying on pause()'s
+              // active-state guard.
+              state.phase = "paused"
+              state.reason = "user"
+              state.pending = false
+              state.pendingInbox = undefined
+              state.busy = false
+              clearRetry(state)
+              persist(state)
+              await notify(sessionID, "goal paused. /goal resume to continue.")
               return
             }
             case "resume":
@@ -1297,6 +1465,17 @@ export default {
 
       const eventDirectory = normaliseDirectory(event?.location?.directory)
       if (eventDirectory && myDirectory && eventDirectory !== myDirectory) return
+
+      const known = states.get(sessionID)
+      if (known && known.phase === "active" && !owns(sessionID)) {
+        // Ownership moved to another live instance; drop the stale local copy
+        // instead of racing it.
+        clearRetry(known)
+        states.delete(sessionID)
+        hydrated.delete(sessionID)
+        const entry = ownerRegistry.owners.get(sessionID)
+        if (entry) foreign.set(sessionID, Date.now() + FOREIGN_RECHECK_MS)
+      }
 
       switch (type) {
         case "session.execution.started": {
@@ -1577,8 +1756,19 @@ export default {
 
     return async (): Promise<void> => {
       controller.abort()
-      for (const state of states.values()) clearRetry(state)
-      await Promise.allSettled([...states.values()].map((state) => persistNow(state)))
+      clearInterval(heartbeat)
+
+      const owned: GoalState[] = []
+      for (const state of states.values()) {
+        clearRetry(state)
+        if (!owns(state.sessionID)) continue
+        owned.push(state)
+      }
+      await Promise.allSettled(owned.map((state) => persistNow(state)))
+      for (const [sessionID, entry] of ownerRegistry.owners) {
+        if (entry.instance === instanceID) ownerRegistry.owners.delete(sessionID)
+      }
+
       for (const registration of disposables) {
         try {
           await registration.dispose()
@@ -1588,6 +1778,7 @@ export default {
       }
       states.clear()
       hydrated.clear()
+      foreign.clear()
     }
   },
 }

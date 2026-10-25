@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import plugin from "../.test-build/index.js"
 
 const STOP = Symbol("stop")
+const OWNER_REGISTRY = Symbol.for("opencode.goal.owner-registry.v1")
 
 class EventBus {
   constructor() {
@@ -183,6 +184,7 @@ async function setup(options, sharedStorage) {
 let passed = 0
 async function test(name, fn) {
   try {
+    globalThis[OWNER_REGISTRY]?.owners?.clear()
     await fn()
     passed++
     console.log(`ok   ${name}`)
@@ -369,6 +371,78 @@ await test("location filter ignores events from other locations", async () => {
   assert.equal(h.synthetics.length, 0)
   await h.cleanup()
   h.bus.close()
+})
+
+await test("a second boot does not steal or pause the owner's active goal", async () => {
+  const shared = new Map()
+  const sid = "s10"
+  const h1 = await setup({}, shared)
+  await cmd(h1, sid, "owner goal")
+  assert.equal(h1.prompts.length, 1)
+
+  const h2 = await setup({}, shared)
+  started(h2, sid)
+  text(h2, sid, "m1", "foreign work\nGOAL_DONE")
+  step(h2, sid, "m1")
+  ok(h2, sid)
+  await wait()
+
+  assert.equal(h2.prompts.length, 0, "foreign boot must not prompt")
+  assert.equal(h2.synthetics.length, 0, "foreign boot must not pause/notify")
+  assert.equal(shared.get(`goal.v1.${sid}`).phase, "active", "owner's goal stays active")
+
+  await h1.cleanup()
+  h1.bus.close()
+  await h2.cleanup()
+  h2.bus.close()
+})
+
+await test("status on another boot is read-only and keeps the owner", async () => {
+  const shared = new Map()
+  const sid = "s11"
+  const h1 = await setup({}, shared)
+  await cmd(h1, sid, "status target")
+
+  const h2 = await setup({}, shared)
+  await cmd(h2, sid, "status")
+  assert.ok(h2.synthetics.some((s) => s.text.includes("status target")))
+  assert.equal(shared.get(`goal.v1.${sid}`).phase, "active")
+
+  started(h1, sid)
+  text(h1, sid, "m1", "owner progress")
+  step(h1, sid, "m1")
+  ok(h1, sid)
+  await wait()
+  assert.equal(h1.prompts.length, 2, "owner still continues after a foreign status check")
+
+  await h1.cleanup()
+  h1.bus.close()
+  await h2.cleanup()
+  h2.bus.close()
+})
+
+await test("stop from another boot takes over and the old owner stands down", async () => {
+  const shared = new Map()
+  const sid = "s12"
+  const h1 = await setup({}, shared)
+  await cmd(h1, sid, "takeover goal")
+
+  const h2 = await setup({}, shared)
+  await cmd(h2, sid, "stop")
+  assert.equal(shared.get(`goal.v1.${sid}`).phase, "paused")
+  assert.ok(h2.synthetics.some((s) => s.text.includes("paused")))
+
+  started(h1, sid)
+  text(h1, sid, "m1", "too late")
+  step(h1, sid, "m1")
+  ok(h1, sid)
+  await wait()
+  assert.equal(h1.prompts.length, 1, "old owner must not continue after losing ownership")
+
+  await h1.cleanup()
+  h1.bus.close()
+  await h2.cleanup()
+  h2.bus.close()
 })
 
 for (const instance of instances) {
