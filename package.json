@@ -1,0 +1,41 @@
+{
+  "name": "opencode-goal",
+  "version": "1.0.0",
+  "description": "OpenCode V2 plugin: an autonomous goal loop with two-layer retries, a quota/balance circuit breaker, and minimal prompt injection.",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node test/unit.test.mjs && node test/integration.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "goal",
+    "agent",
+    "autonomous",
+    "retry",
+    "backoff",
+    "quota",
+    "budget"
+  ],
+  "license": "MIT",
+  "author": "Jason Gu (Excurs1ons)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Excurs1ons/opencode-goal.git"
+  },
+  "homepage": "https://github.com/Excurs1ons/opencode-goal",
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
